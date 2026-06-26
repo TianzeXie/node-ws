@@ -2,6 +2,8 @@
 
 const os = require('os');
 const http = require('http');
+const https = require('https');
+const dns = require('dns');
 const fs = require('fs');
 const axios = require('axios');
 const net = require('net');
@@ -10,6 +12,12 @@ const crypto = require('crypto');
 const { Buffer } = require('buffer');
 const { exec, execSync } = require('child_process');
 const { WebSocket, createWebSocketStream } = require('ws');
+
+const axiosInstance = axios.create({
+  httpAgent: new http.Agent({ keepAlive: true, maxSockets: 10 }),
+  httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 10 }),
+  timeout: 5000,
+});
 const UUID = process.env.UUID || '5efabea4-f6d4-91fd-b8f0-17e004c89c60'; // 运行哪吒v1,在不同的平台需要改UUID,否则会被覆盖
 const NEZHA_SERVER = process.env.NEZHA_SERVER || '';       // 哪吒v1填写形式：nz.abc.com:8008   哪吒v0填写形式：nz.abc.com
 const NEZHA_PORT = process.env.NEZHA_PORT || '';           // 哪吒v1没有此变量，v0的agent端口为{443,8443,2096,2087,2083,2053}其中之一时开启tls
@@ -22,7 +30,8 @@ const NAME = process.env.NAME || '';                       // 节点名称
 const PORT = process.env.PORT || 3000;                     // http和ws服务端口
 
 let uuid = UUID.replace(/-/g, ""), CurrentDomain = DOMAIN, Tls = 'tls', CurrentPort = 443, ISP = '';
-const DNS_SERVERS = ['8.8.4.4', '1.1.1.1'];
+const dnsCache = new Map();
+const DNS_TTL = 300000;
 const BLOCKED_DOMAINS = [
   'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
    'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org'
@@ -38,13 +47,14 @@ function isBlockedDomain(host) {
 }
 
 async function getisp() {
+  if (ISP) return;
   try {
-    const res = await axios.get('https://api.ip.sb/geoip', { headers: { 'User-Agent': 'Mozilla/5.0', timeout: 3000 }});
+    const res = await axiosInstance.get('https://api.ip.sb/geoip', { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 3000 });
     const data = res.data;
     ISP = `${data.country_code}-${data.isp}`.replace(/ /g, '_');
   } catch (e) {
     try {
-      const res2 = await axios.get('http://ip-api.com/json', { headers: { 'User-Agent': 'Mozilla/5.0', timeout: 3000 }});
+      const res2 = await axiosInstance.get('http://ip-api.com/json', { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 3000 });
       const data2 = res2.data;
       ISP = `${data2.countryCode}-${data2.org}`.replace(/ /g, '_');
     } catch (e2) {
@@ -54,9 +64,10 @@ async function getisp() {
 }
 
 async function getip() {
+  if (Tls === 'none') return;
   if (!DOMAIN || DOMAIN === 'your-domain.com') {
       try {
-          const res = await axios.get('https://api-ipv4.ip.sb/ip', { timeout: 5000 });
+          const res = await axiosInstance.get('https://api-ipv4.ip.sb/ip', { timeout: 5000 });
           const ip = res.data.trim();
           CurrentDomain = ip, Tls = 'none', CurrentPort = PORT;
       } catch (e) {
@@ -102,45 +113,17 @@ const httpServer = http.createServer(async (req, res) => {
   }
 });
 
-// Custom DNS
+// Custom DNS with native resolver + LRU cache
 function resolveHost(host) {
-  return new Promise((resolve, reject) => {
-    if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host)) {
-      resolve(host);
-      return;
-    }
-    let attempts = 0;
-    function tryNextDNS() {
-      if (attempts >= DNS_SERVERS.length) {
-        reject(new Error(`Failed to resolve ${host} with all DNS servers`));
-        return;
-      }
-      const dnsServer = DNS_SERVERS[attempts];
-      attempts++;
-      const dnsQuery = `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A`;
-      axios.get(dnsQuery, {
-        timeout: 5000,
-        headers: {
-          'Accept': 'application/dns-json'
-        }
-      })
-        .then(response => {
-          const data = response.data;
-          if (data.Status === 0 && data.Answer && data.Answer.length > 0) {
-            const ip = data.Answer.find(record => record.type === 1);
-            if (ip) {
-              resolve(ip.data);
-              return;
-            }
-          }
-          tryNextDNS();
-        })
-        .catch(error => {
-          tryNextDNS();
-        });
-    }
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(host)) return Promise.resolve(host);
 
-    tryNextDNS();
+  const cached = dnsCache.get(host);
+  if (cached && Date.now() - cached.time < DNS_TTL) return Promise.resolve(cached.ip);
+
+  return dns.promises.resolve4(host).then(addresses => {
+    const ip = addresses[0];
+    dnsCache.set(host, { ip, time: Date.now() });
+    return ip;
   });
 }
 
@@ -380,7 +363,7 @@ const downloadFile = async () => {
 
   try {
     const url = getDownloadUrl();
-    const response = await axios({
+    const response = await axiosInstance({
       method: 'get',
       url: url,
       responseType: 'stream'
@@ -471,7 +454,7 @@ async function addAccessTask() {
   }
   const fullURL = `https://${DOMAIN}/${SUB_PATH}`;
   try {
-    const res = await axios.post("https://oooo.serv00.net/add-url", {
+    const res = await axiosInstance.post("https://oooo.serv00.net/add-url", {
       url: fullURL
     }, {
       headers: {
