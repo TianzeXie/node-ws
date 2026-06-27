@@ -8,6 +8,7 @@ const net = require('net');
 const path = require('path');
 const crypto = require('crypto');
 const { Buffer } = require('buffer');
+const dns = require('dns').promises;
 const { exec, execSync } = require('child_process');
 const { WebSocket, createWebSocketStream } = require('ws');
 const UUID = process.env.UUID || '5efabea4-f6d4-91fd-b8f0-17e004c89c60'; // 运行哪吒v1,在不同的平台需要改UUID,否则会被覆盖
@@ -104,44 +105,11 @@ const httpServer = http.createServer(async (req, res) => {
 
 // Custom DNS
 function resolveHost(host) {
-  return new Promise((resolve, reject) => {
-    if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host)) {
-      resolve(host);
-      return;
-    }
-    let attempts = 0;
-    function tryNextDNS() {
-      if (attempts >= DNS_SERVERS.length) {
-        reject(new Error(`Failed to resolve ${host} with all DNS servers`));
-        return;
-      }
-      const dnsServer = DNS_SERVERS[attempts];
-      attempts++;
-      const dnsQuery = `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A`;
-      axios.get(dnsQuery, {
-        timeout: 5000,
-        headers: {
-          'Accept': 'application/dns-json'
-        }
-      })
-        .then(response => {
-          const data = response.data;
-          if (data.Status === 0 && data.Answer && data.Answer.length > 0) {
-            const ip = data.Answer.find(record => record.type === 1);
-            if (ip) {
-              resolve(ip.data);
-              return;
-            }
-          }
-          tryNextDNS();
-        })
-        .catch(error => {
-          tryNextDNS();
-        });
-    }
-
-    tryNextDNS();
-  });
+  // 已经是 IP 格式就直接返回
+  if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host)) {
+    return Promise.resolve(host);
+  }
+  return dns.resolve4(host).then(addrs => addrs[0]);
 }
 
 // VLE-SS处理
